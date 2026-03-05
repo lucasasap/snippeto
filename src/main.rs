@@ -1,6 +1,7 @@
 mod config;
 mod expander;
 mod keymap;
+mod snippet;
 
 use evdev::{Device, EventSummary, KeyCode};
 use keymap::{ShiftState, keycode_to_char};
@@ -71,10 +72,7 @@ fn main() {
         std::process::exit(1);
     }
 
-    eprintln!(
-        "snippeto: found {} keyboard device(s)",
-        keyboards.len()
-    );
+    eprintln!("snippeto: found {} keyboard device(s)", keyboards.len());
 
     let mut expander = match expander::Expander::new(config.snippets) {
         Ok(e) => e,
@@ -92,18 +90,20 @@ fn main() {
         let name = device.name().unwrap_or("unknown").to_string();
         eprintln!("snippeto: monitoring {name} at {}", path.display());
 
-        thread::spawn(move || loop {
-            match device.fetch_events() {
-                Ok(events) => {
-                    for event in events {
-                        if let EventSummary::Key(_, code, value) = event.destructure() {
-                            let _ = tx.send(KeyEvent { code, value });
+        thread::spawn(move || {
+            loop {
+                match device.fetch_events() {
+                    Ok(events) => {
+                        for event in events {
+                            if let EventSummary::Key(_, code, value) = event.destructure() {
+                                let _ = tx.send(KeyEvent { code, value });
+                            }
                         }
                     }
-                }
-                Err(e) => {
-                    eprintln!("snippeto: device error on {name}: {e}");
-                    break;
+                    Err(e) => {
+                        eprintln!("snippeto: device error on {name}: {e}");
+                        break;
+                    }
                 }
             }
         });

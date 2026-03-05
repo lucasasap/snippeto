@@ -1,10 +1,11 @@
 use evdev::uinput::VirtualDevice;
 use evdev::{AttributeSet, EventType, InputEvent, KeyCode};
-use std::collections::HashMap;
 use std::io::Write;
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
+
+use crate::snippet::Snippet;
 
 const MAX_BUFFER_SIZE: usize = 128;
 const KEY_DELAY: Duration = Duration::from_millis(5);
@@ -12,12 +13,19 @@ const PASTE_DELAY: Duration = Duration::from_millis(50);
 
 pub struct Expander {
     buffer: String,
-    snippets: HashMap<String, String>,
+    snippets: Vec<Snippet>,
     virtual_kbd: VirtualDevice,
 }
 
 impl Expander {
-    pub fn new(snippets: HashMap<String, String>) -> std::io::Result<Self> {
+    pub fn new(mut snippets: Vec<Snippet>) -> std::io::Result<Self> {
+        snippets.sort_by(|left, right| {
+            right
+                .trigger_len()
+                .cmp(&left.trigger_len())
+                .then_with(|| left.trigger().cmp(right.trigger()))
+        });
+
         let virtual_kbd = Self::create_virtual_keyboard()?;
         // Give uinput time to register the device
         thread::sleep(Duration::from_millis(200));
@@ -56,9 +64,17 @@ impl Expander {
     }
 
     fn find_match(&self) -> Option<(usize, String)> {
-        for (trigger, replacement) in &self.snippets {
-            if self.buffer.ends_with(trigger.as_str()) {
-                return Some((trigger.chars().count(), replacement.clone()));
+        for snippet in &self.snippets {
+            if self.buffer.ends_with(snippet.trigger()) {
+                match snippet.render() {
+                    Ok(replacement) => {
+                        return Some((snippet.trigger_len(), replacement));
+                    }
+                    Err(error) => {
+                        eprintln!("snippeto: failed to expand {}: {error}", snippet.trigger());
+                        return None;
+                    }
+                }
             }
         }
         None
