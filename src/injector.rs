@@ -2,9 +2,9 @@ use evdev::uinput::VirtualDevice;
 use evdev::{AttributeSet, EventType, InputEvent, KeyCode};
 use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::raw::c_char;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -13,8 +13,11 @@ use crate::keymap::{EVDEV_OFFSET, ffi};
 
 const DEFAULT_KEY_DELAY_MS: u64 = 5;
 const DEFAULT_PASTE_DELAY_MS: u64 = 50;
+const DEFAULT_CLIPBOARD_TIMEOUT_MS: u64 = 2000;
 const DEFAULT_RELEASE_POLL_MS: u64 = 50;
 const DEFAULT_RELEASE_TIMEOUT_MS: u64 = 4000;
+const COMMAND_POLL_INTERVAL_MS: u64 = 10;
+const DEFAULT_WAYLAND_PASTE_SHORTCUT: &str = "shift+insert";
 
 const MAX_VIRTUAL_KEYCODE: u16 = 255;
 const MIN_XKB_KEYCODE: u32 = EVDEV_OFFSET;
@@ -46,8 +49,10 @@ pub struct Injector {
     has_clipboard: bool,
     key_delay: Duration,
     paste_delay: Duration,
+    clipboard_timeout: Duration,
     release_poll: Duration,
     release_timeout: Duration,
+    paste_shortcut: Vec<u16>,
 }
 
 impl Injector {
@@ -68,11 +73,16 @@ impl Injector {
             has_clipboard,
             key_delay: duration_from_env("SNIPPETO_KEY_DELAY_MS", DEFAULT_KEY_DELAY_MS),
             paste_delay: duration_from_env("SNIPPETO_PASTE_DELAY_MS", DEFAULT_PASTE_DELAY_MS),
+            clipboard_timeout: duration_from_env(
+                "SNIPPETO_CLIPBOARD_TIMEOUT_MS",
+                DEFAULT_CLIPBOARD_TIMEOUT_MS,
+            ),
             release_poll: duration_from_env("SNIPPETO_RELEASE_POLL_MS", DEFAULT_RELEASE_POLL_MS),
             release_timeout: duration_from_env(
                 "SNIPPETO_RELEASE_TIMEOUT_MS",
                 DEFAULT_RELEASE_TIMEOUT_MS,
             ),
+            paste_shortcut: paste_shortcut_from_env(),
         })
     }
 
@@ -106,11 +116,18 @@ impl Injector {
 
         let saved_clipboard = self.get_clipboard();
 
-        self.send_backspaces(trigger_len)?;
-        self.set_clipboard(replacement)?;
-        thread::sleep(self.paste_delay);
-        self.send_paste()?;
-        thread::sleep(self.paste_delay);
+        let inject_result = (|| -> io::Result<()> {
+            self.send_backspaces(trigger_len)?;
+            self.set_clipboard(replacement)?;
+            thread::sleep(self.paste_delay);
+            self.send_paste()?;
+            Ok(())
+        })();
+
+        // Wait before restoring so the paste target can consume clipboard data first.
+        if saved_clipboard.is_some() {
+            thread::sleep(self.paste_delay);
+        }
 
         if let Some(saved) = saved_clipboard
             && let Err(error) = self.set_clipboard(&saved)
@@ -118,7 +135,7 @@ impl Injector {
             eprintln!("snippeto: failed to restore clipboard: {error}");
         }
 
-        Ok(())
+        inject_result
     }
 
     fn can_type_text(&self, text: &str) -> bool {
@@ -173,9 +190,34 @@ impl Injector {
     }
 
     fn send_paste(&mut self) -> io::Result<()> {
-        self.key_down(KeyCode::KEY_LEFTCTRL.code())?;
-        self.tap_key(KeyCode::KEY_V.code())?;
-        self.key_up(KeyCode::KEY_LEFTCTRL.code())
+        let combo = self.paste_shortcut.clone();
+        let Some((main_key, modifiers)) = combo.split_last() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "paste shortcut cannot be empty",
+            ));
+        };
+
+        for modifier in modifiers {
+            self.key_down(*modifier)?;
+        }
+
+        let tap_result = self.tap_key(*main_key);
+        let mut release_error = None;
+        for modifier in modifiers.iter().rev() {
+            if let Err(error) = self.key_up(*modifier)
+                && release_error.is_none()
+            {
+                release_error = Some(error);
+            }
+        }
+
+        tap_result?;
+        if let Some(error) = release_error {
+            return Err(error);
+        }
+
+        Ok(())
     }
 
     fn tap_key(&mut self, code: u16) -> io::Result<()> {
@@ -221,17 +263,37 @@ impl Injector {
     }
 
     fn get_clipboard(&self) -> Option<String> {
-        Command::new("wl-paste")
+        match self.get_clipboard_with_timeout() {
+            Ok(text) => Some(text),
+            Err(error) => {
+                eprintln!("snippeto: failed to read clipboard: {error}");
+                None
+            }
+        }
+    }
+
+    fn get_clipboard_with_timeout(&self) -> io::Result<String> {
+        let mut child = Command::new("wl-paste")
             .arg("--no-newline")
-            .output()
-            .ok()
-            .and_then(|output| {
-                if output.status.success() {
-                    String::from_utf8(output.stdout).ok()
-                } else {
-                    None
-                }
-            })
+            .stdout(Stdio::piped())
+            .spawn()
+            .map_err(|e| io::Error::other(format!("failed to run wl-paste: {e}")))?;
+
+        let status = wait_for_child_with_timeout(&mut child, self.clipboard_timeout, "wl-paste")?;
+        if !status.success() {
+            return Err(io::Error::other(format!(
+                "wl-paste exited unsuccessfully: {status}"
+            )));
+        }
+
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("wl-paste did not expose stdout"))?;
+        let mut output = Vec::new();
+        stdout.read_to_end(&mut output)?;
+        String::from_utf8(output)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("utf8 error: {e}")))
     }
 
     fn set_clipboard(&self, text: &str) -> io::Result<()> {
@@ -243,8 +305,10 @@ impl Injector {
         if let Some(ref mut stdin) = child.stdin {
             stdin.write_all(text.as_bytes())?;
         }
+        // Close stdin so wl-copy can complete after consuming the payload.
+        drop(child.stdin.take());
 
-        let status = child.wait()?;
+        let status = wait_for_child_with_timeout(&mut child, self.clipboard_timeout, "wl-copy")?;
         if status.success() {
             Ok(())
         } else {
@@ -253,6 +317,86 @@ impl Injector {
             )))
         }
     }
+}
+
+fn wait_for_child_with_timeout(
+    child: &mut Child,
+    timeout: Duration,
+    command_name: &str,
+) -> io::Result<ExitStatus> {
+    let start = Instant::now();
+
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+
+        if start.elapsed() >= timeout {
+            eprintln!(
+                "snippeto: {command_name} timed out after {}ms, killing process",
+                timeout.as_millis()
+            );
+
+            if let Err(error) = child.kill() {
+                eprintln!("snippeto: failed to kill {command_name}: {error}");
+            }
+
+            if let Err(error) = child.wait() {
+                eprintln!("snippeto: failed to reap {command_name}: {error}");
+            }
+
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("{command_name} timed out"),
+            ));
+        }
+
+        thread::sleep(Duration::from_millis(COMMAND_POLL_INTERVAL_MS));
+    }
+}
+
+fn paste_shortcut_from_env() -> Vec<u16> {
+    let default = vec![KeyCode::KEY_LEFTSHIFT.code(), KeyCode::KEY_INSERT.code()];
+    let Ok(raw) = std::env::var("SNIPPETO_PASTE_SHORTCUT") else {
+        return default;
+    };
+
+    match parse_paste_shortcut(&raw) {
+        Some(combo) => combo,
+        None => {
+            eprintln!(
+                "snippeto: invalid SNIPPETO_PASTE_SHORTCUT `{raw}`, using {DEFAULT_WAYLAND_PASTE_SHORTCUT}"
+            );
+            default
+        }
+    }
+}
+
+fn parse_paste_shortcut(raw: &str) -> Option<Vec<u16>> {
+    let mut combo = Vec::new();
+    for token in raw.split('+') {
+        let key = parse_paste_shortcut_token(token.trim())?;
+        combo.push(key);
+    }
+
+    if combo.is_empty() { None } else { Some(combo) }
+}
+
+fn parse_paste_shortcut_token(token: &str) -> Option<u16> {
+    let token = token.to_ascii_lowercase();
+    Some(match token.as_str() {
+        "ctrl" | "control" | "leftctrl" => KeyCode::KEY_LEFTCTRL.code(),
+        "rightctrl" => KeyCode::KEY_RIGHTCTRL.code(),
+        "shift" | "leftshift" => KeyCode::KEY_LEFTSHIFT.code(),
+        "rightshift" => KeyCode::KEY_RIGHTSHIFT.code(),
+        "alt" | "leftalt" => KeyCode::KEY_LEFTALT.code(),
+        "rightalt" | "altgr" => KeyCode::KEY_RIGHTALT.code(),
+        "meta" | "super" | "win" | "leftmeta" => KeyCode::KEY_LEFTMETA.code(),
+        "rightmeta" => KeyCode::KEY_RIGHTMETA.code(),
+        "insert" | "ins" => KeyCode::KEY_INSERT.code(),
+        "v" => KeyCode::KEY_V.code(),
+        _ => return None,
+    })
 }
 
 fn generate_char_map() -> Result<HashMap<String, KeyRecord>, String> {
@@ -388,7 +532,8 @@ fn duration_from_env(name: &str, default_ms: u64) -> Duration {
 
 #[cfg(test)]
 mod tests {
-    use super::generate_modifier_combos;
+    use super::{generate_modifier_combos, parse_paste_shortcut};
+    use evdev::KeyCode;
 
     #[test]
     fn modifier_combo_generation_matches_expected_size() {
@@ -396,5 +541,29 @@ mod tests {
         assert_eq!(combos.len(), 176);
         assert!(combos.iter().any(|combo| combo.is_empty()));
         assert!(combos.iter().all(|combo| combo.len() <= 3));
+    }
+
+    #[test]
+    fn parses_shift_insert_paste_shortcut() {
+        assert_eq!(
+            parse_paste_shortcut("Shift+Insert"),
+            Some(vec![
+                KeyCode::KEY_LEFTSHIFT.code(),
+                KeyCode::KEY_INSERT.code()
+            ])
+        );
+    }
+
+    #[test]
+    fn parses_ctrl_v_paste_shortcut() {
+        assert_eq!(
+            parse_paste_shortcut("ctrl+v"),
+            Some(vec![KeyCode::KEY_LEFTCTRL.code(), KeyCode::KEY_V.code()])
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_paste_shortcut() {
+        assert!(parse_paste_shortcut("ctrl+banana").is_none());
     }
 }
