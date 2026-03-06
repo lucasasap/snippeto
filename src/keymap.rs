@@ -2,68 +2,70 @@ use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::ptr;
 
-// --- xkbcommon FFI bindings (minimal set) ---
+pub(crate) mod ffi {
+    use std::os::raw::c_char;
 
-#[allow(non_camel_case_types)]
-enum xkb_context {}
-#[allow(non_camel_case_types)]
-enum xkb_keymap {}
-#[allow(non_camel_case_types)]
-enum xkb_state {}
+    #[allow(non_camel_case_types)]
+    pub enum xkb_context {}
+    #[allow(non_camel_case_types)]
+    pub enum xkb_keymap {}
+    #[allow(non_camel_case_types)]
+    pub enum xkb_state {}
 
-#[repr(C)]
-struct xkb_rule_names {
-    rules: *const c_char,
-    model: *const c_char,
-    layout: *const c_char,
-    variant: *const c_char,
-    options: *const c_char,
-}
+    #[repr(C)]
+    pub struct xkb_rule_names {
+        pub rules: *const c_char,
+        pub model: *const c_char,
+        pub layout: *const c_char,
+        pub variant: *const c_char,
+        pub options: *const c_char,
+    }
 
-#[repr(C)]
-#[allow(clippy::upper_case_acronyms)]
-enum xkb_key_direction {
-    UP,
-    DOWN,
-}
+    #[repr(C)]
+    #[allow(clippy::upper_case_acronyms)]
+    pub enum xkb_key_direction {
+        UP,
+        DOWN,
+    }
 
-const XKB_CONTEXT_NO_FLAGS: u32 = 0;
-const XKB_KEYMAP_COMPILE_NO_FLAGS: u32 = 0;
+    pub const XKB_CONTEXT_NO_FLAGS: u32 = 0;
+    pub const XKB_KEYMAP_COMPILE_NO_FLAGS: u32 = 0;
 
-#[link(name = "xkbcommon")]
-unsafe extern "C" {
-    fn xkb_context_new(flags: u32) -> *mut xkb_context;
-    fn xkb_context_unref(context: *mut xkb_context);
-    fn xkb_keymap_new_from_names(
-        context: *mut xkb_context,
-        names: *const xkb_rule_names,
-        flags: u32,
-    ) -> *mut xkb_keymap;
-    fn xkb_keymap_unref(keymap: *mut xkb_keymap);
-    fn xkb_state_new(keymap: *mut xkb_keymap) -> *mut xkb_state;
-    fn xkb_state_unref(state: *mut xkb_state);
-    fn xkb_state_update_key(
-        state: *mut xkb_state,
-        key: u32,
-        direction: xkb_key_direction,
-    ) -> u32;
-    fn xkb_state_key_get_utf8(
-        state: *mut xkb_state,
-        key: u32,
-        buffer: *mut c_char,
-        size: usize,
-    ) -> i32;
+    #[link(name = "xkbcommon")]
+    unsafe extern "C" {
+        pub fn xkb_context_new(flags: u32) -> *mut xkb_context;
+        pub fn xkb_context_unref(context: *mut xkb_context);
+        pub fn xkb_keymap_new_from_names(
+            context: *mut xkb_context,
+            names: *const xkb_rule_names,
+            flags: u32,
+        ) -> *mut xkb_keymap;
+        pub fn xkb_keymap_unref(keymap: *mut xkb_keymap);
+        pub fn xkb_state_new(keymap: *mut xkb_keymap) -> *mut xkb_state;
+        pub fn xkb_state_unref(state: *mut xkb_state);
+        pub fn xkb_state_update_key(
+            state: *mut xkb_state,
+            key: u32,
+            direction: xkb_key_direction,
+        ) -> u32;
+        pub fn xkb_state_key_get_utf8(
+            state: *mut xkb_state,
+            key: u32,
+            buffer: *mut c_char,
+            size: usize,
+        ) -> i32;
+    }
 }
 
 /// Offset between evdev keycodes and XKB keycodes.
-const EVDEV_OFFSET: u32 = 8;
+pub(crate) const EVDEV_OFFSET: u32 = 8;
 
 /// xkbcommon-based key state that handles layout-aware character decoding
 /// with full modifier tracking (Shift, Ctrl, Alt, Meta, CapsLock, NumLock, AltGr).
 pub struct XkbState {
-    context: *mut xkb_context,
-    keymap: *mut xkb_keymap,
-    state: *mut xkb_state,
+    context: *mut ffi::xkb_context,
+    keymap: *mut ffi::xkb_keymap,
+    state: *mut ffi::xkb_state,
 }
 
 // Safety: XkbState owns its raw pointers exclusively and each instance
@@ -73,13 +75,13 @@ unsafe impl Send for XkbState {}
 impl XkbState {
     /// Create a new XkbState using the system's default keyboard layout.
     pub fn new() -> Result<Self, String> {
-        let context = unsafe { xkb_context_new(XKB_CONTEXT_NO_FLAGS) };
+        let context = unsafe { ffi::xkb_context_new(ffi::XKB_CONTEXT_NO_FLAGS) };
         if context.is_null() {
             return Err("failed to create xkb context".into());
         }
 
         // Null pointers = use system defaults (XKB_DEFAULT_RULES env vars)
-        let names = xkb_rule_names {
+        let names = ffi::xkb_rule_names {
             rules: ptr::null(),
             model: ptr::null(),
             layout: ptr::null(),
@@ -88,18 +90,18 @@ impl XkbState {
         };
 
         let keymap = unsafe {
-            xkb_keymap_new_from_names(context, &names, XKB_KEYMAP_COMPILE_NO_FLAGS)
+            ffi::xkb_keymap_new_from_names(context, &names, ffi::XKB_KEYMAP_COMPILE_NO_FLAGS)
         };
         if keymap.is_null() {
-            unsafe { xkb_context_unref(context) };
+            unsafe { ffi::xkb_context_unref(context) };
             return Err("failed to create xkb keymap".into());
         }
 
-        let state = unsafe { xkb_state_new(keymap) };
+        let state = unsafe { ffi::xkb_state_new(keymap) };
         if state.is_null() {
             unsafe {
-                xkb_keymap_unref(keymap);
-                xkb_context_unref(context);
+                ffi::xkb_keymap_unref(keymap);
+                ffi::xkb_context_unref(context);
             }
             return Err("failed to create xkb state".into());
         }
@@ -128,11 +130,11 @@ impl XkbState {
 
         // Update modifier tracking
         let direction = if value == 0 {
-            xkb_key_direction::UP
+            ffi::xkb_key_direction::UP
         } else {
-            xkb_key_direction::DOWN
+            ffi::xkb_key_direction::DOWN
         };
-        unsafe { xkb_state_update_key(self.state, keycode, direction) };
+        unsafe { ffi::xkb_state_update_key(self.state, keycode, direction) };
 
         char_value
     }
@@ -141,8 +143,8 @@ impl XkbState {
     pub fn sync_key_toggle(&self, evdev_code: u16) {
         let keycode = evdev_code as u32 + EVDEV_OFFSET;
         unsafe {
-            xkb_state_update_key(self.state, keycode, xkb_key_direction::DOWN);
-            xkb_state_update_key(self.state, keycode, xkb_key_direction::UP);
+            ffi::xkb_state_update_key(self.state, keycode, ffi::xkb_key_direction::DOWN);
+            ffi::xkb_state_update_key(self.state, keycode, ffi::xkb_key_direction::UP);
         }
     }
 
@@ -150,14 +152,14 @@ impl XkbState {
     pub fn sync_key_down(&self, evdev_code: u16) {
         let keycode = evdev_code as u32 + EVDEV_OFFSET;
         unsafe {
-            xkb_state_update_key(self.state, keycode, xkb_key_direction::DOWN);
+            ffi::xkb_state_update_key(self.state, keycode, ffi::xkb_key_direction::DOWN);
         }
     }
 
     fn key_get_utf8(&self, keycode: u32) -> String {
         let mut buffer: [c_char; 16] = [0; 16];
         let len = unsafe {
-            xkb_state_key_get_utf8(self.state, keycode, buffer.as_mut_ptr(), buffer.len())
+            ffi::xkb_state_key_get_utf8(self.state, keycode, buffer.as_mut_ptr(), buffer.len())
         };
         if len <= 0 {
             return String::new();
@@ -170,9 +172,9 @@ impl XkbState {
 impl Drop for XkbState {
     fn drop(&mut self) {
         unsafe {
-            xkb_state_unref(self.state);
-            xkb_keymap_unref(self.keymap);
-            xkb_context_unref(self.context);
+            ffi::xkb_state_unref(self.state);
+            ffi::xkb_keymap_unref(self.keymap);
+            ffi::xkb_context_unref(self.context);
         }
     }
 }

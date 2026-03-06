@@ -1,12 +1,14 @@
 mod config;
 mod expander;
+mod injector;
 mod keymap;
 mod snippet;
 
 use evdev::{Device, EventSummary, KeyCode, LedCode};
 use keymap::XkbState;
+use std::collections::HashSet;
 use std::process::Command;
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 struct KeyEvent {
@@ -33,17 +35,25 @@ fn find_keyboards() -> Vec<(std::path::PathBuf, Device)> {
         .collect()
 }
 
-fn check_dependencies() {
-    for cmd in &["wl-copy", "wl-paste"] {
-        if Command::new("which")
-            .arg(cmd)
-            .output()
-            .map(|o| !o.status.success())
-            .unwrap_or(true)
-        {
-            eprintln!("snippeto: {cmd} not found, install wl-clipboard");
-            std::process::exit(1);
-        }
+fn check_clipboard_available() -> bool {
+    let has_wl_copy = Command::new("which")
+        .arg("wl-copy")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+    let has_wl_paste = Command::new("which")
+        .arg("wl-paste")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+
+    if has_wl_copy && has_wl_paste {
+        true
+    } else {
+        eprintln!(
+            "snippeto: wl-clipboard not fully available; typed injection will still work, but unmappable characters cannot use clipboard fallback"
+        );
+        false
     }
 }
 
@@ -78,7 +88,7 @@ fn sync_initial_modifiers(device: &Device, xkb: &XkbState) {
 }
 
 fn main() {
-    check_dependencies();
+    let has_clipboard = check_clipboard_available();
 
     let config = match config::load_config() {
         Ok(c) => c,
@@ -105,20 +115,24 @@ fn main() {
 
     eprintln!("snippeto: found {} keyboard device(s)", keyboards.len());
 
-    let mut expander = match expander::Expander::new(config.snippets) {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("snippeto: failed to create virtual keyboard: {e}");
-            eprintln!("snippeto: is the uinput module loaded? (modprobe uinput)");
-            std::process::exit(1);
-        }
-    };
+    let pressed_keys = Arc::new(Mutex::new(HashSet::new()));
+
+    let mut expander =
+        match expander::Expander::new(config.snippets, pressed_keys.clone(), has_clipboard) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("snippeto: failed to initialize expander: {e}");
+                eprintln!("snippeto: is the uinput module loaded? (modprobe uinput)");
+                std::process::exit(1);
+            }
+        };
 
     let (tx, rx) = mpsc::channel::<KeyEvent>();
 
     for (path, mut device) in keyboards {
         let tx = tx.clone();
         let name = device.name().unwrap_or("unknown").to_string();
+        let pressed_keys = pressed_keys.clone();
         eprintln!("snippeto: monitoring {name} at {}", path.display());
 
         let xkb = match XkbState::new() {
@@ -137,6 +151,18 @@ fn main() {
                     Ok(events) => {
                         for event in events {
                             if let EventSummary::Key(_, code, value) = event.destructure() {
+                                if let Ok(mut pressed) = pressed_keys.lock() {
+                                    match value {
+                                        0 => {
+                                            pressed.remove(&code.code());
+                                        }
+                                        1 | 2 => {
+                                            pressed.insert(code.code());
+                                        }
+                                        _ => {}
+                                    }
+                                }
+
                                 let char_value = xkb.process_key(code.code(), value);
                                 let _ = tx.send(KeyEvent {
                                     code,

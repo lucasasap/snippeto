@@ -1,24 +1,23 @@
-use evdev::uinput::VirtualDevice;
-use evdev::{AttributeSet, EventType, InputEvent, KeyCode};
-use std::io::Write;
-use std::process::Command;
-use std::thread;
-use std::time::Duration;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 
+use crate::injector::Injector;
 use crate::snippet::Snippet;
 
 const MAX_BUFFER_SIZE: usize = 128;
-const KEY_DELAY: Duration = Duration::from_millis(5);
-const PASTE_DELAY: Duration = Duration::from_millis(50);
 
 pub struct Expander {
     buffer: String,
     snippets: Vec<Snippet>,
-    virtual_kbd: VirtualDevice,
+    injector: Injector,
 }
 
 impl Expander {
-    pub fn new(mut snippets: Vec<Snippet>) -> std::io::Result<Self> {
+    pub fn new(
+        mut snippets: Vec<Snippet>,
+        pressed_keys: Arc<Mutex<HashSet<u16>>>,
+        has_clipboard: bool,
+    ) -> std::io::Result<Self> {
         snippets.sort_by(|left, right| {
             right
                 .trigger_len()
@@ -26,29 +25,16 @@ impl Expander {
                 .then_with(|| left.trigger().cmp(right.trigger()))
         });
 
-        let virtual_kbd = Self::create_virtual_keyboard()?;
-        // Give uinput time to register the device
-        thread::sleep(Duration::from_millis(200));
+        let injector = Injector::new(pressed_keys, has_clipboard)?;
+
         Ok(Self {
             buffer: String::with_capacity(MAX_BUFFER_SIZE),
             snippets,
-            virtual_kbd,
+            injector,
         })
     }
 
-    fn create_virtual_keyboard() -> std::io::Result<VirtualDevice> {
-        let mut keys = AttributeSet::<KeyCode>::new();
-        keys.insert(KeyCode::KEY_BACKSPACE);
-        keys.insert(KeyCode::KEY_LEFTCTRL);
-        keys.insert(KeyCode::KEY_V);
-
-        VirtualDevice::builder()?
-            .name("snippeto-virtual-keyboard")
-            .with_keys(&keys)?
-            .build()
-    }
-
-    /// Process a typed character. Returns true if an expansion was triggered.
+    /// Process a typed character.
     pub fn push_char(&mut self, ch: char) {
         self.buffer.push(ch);
 
@@ -58,7 +44,9 @@ impl Expander {
         }
 
         if let Some((trigger_len, replacement)) = self.find_match() {
-            self.expand(trigger_len, &replacement);
+            if let Err(error) = self.injector.expand(trigger_len, &replacement) {
+                eprintln!("snippeto: failed to inject expansion: {error}");
+            }
             self.buffer.clear();
         }
     }
@@ -78,79 +66,6 @@ impl Expander {
             }
         }
         None
-    }
-
-    fn expand(&mut self, trigger_len: usize, replacement: &str) {
-        let saved_clipboard = self.get_clipboard();
-
-        self.send_backspaces(trigger_len);
-        self.set_clipboard(replacement);
-        thread::sleep(PASTE_DELAY);
-        self.send_paste();
-        thread::sleep(PASTE_DELAY);
-
-        if let Some(ref saved) = saved_clipboard {
-            self.set_clipboard(saved);
-        }
-    }
-
-    fn send_backspaces(&mut self, count: usize) {
-        for _ in 0..count {
-            let down = InputEvent::new(EventType::KEY.0, KeyCode::KEY_BACKSPACE.code(), 1);
-            self.virtual_kbd.emit(&[down]).ok();
-            thread::sleep(KEY_DELAY);
-
-            let up = InputEvent::new(EventType::KEY.0, KeyCode::KEY_BACKSPACE.code(), 0);
-            self.virtual_kbd.emit(&[up]).ok();
-            thread::sleep(KEY_DELAY);
-        }
-    }
-
-    fn send_paste(&mut self) {
-        let ctrl_down = InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFTCTRL.code(), 1);
-        let v_down = InputEvent::new(EventType::KEY.0, KeyCode::KEY_V.code(), 1);
-        let v_up = InputEvent::new(EventType::KEY.0, KeyCode::KEY_V.code(), 0);
-        let ctrl_up = InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFTCTRL.code(), 0);
-
-        self.virtual_kbd.emit(&[ctrl_down]).ok();
-        thread::sleep(KEY_DELAY);
-        self.virtual_kbd.emit(&[v_down]).ok();
-        thread::sleep(KEY_DELAY);
-        self.virtual_kbd.emit(&[v_up]).ok();
-        thread::sleep(KEY_DELAY);
-        self.virtual_kbd.emit(&[ctrl_up]).ok();
-        thread::sleep(KEY_DELAY);
-    }
-
-    fn get_clipboard(&self) -> Option<String> {
-        Command::new("wl-paste")
-            .arg("--no-newline")
-            .output()
-            .ok()
-            .and_then(|o| {
-                if o.status.success() {
-                    String::from_utf8(o.stdout).ok()
-                } else {
-                    None
-                }
-            })
-    }
-
-    fn set_clipboard(&self, text: &str) {
-        let mut child = match Command::new("wl-copy")
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("snippeto: failed to run wl-copy: {e}");
-                return;
-            }
-        };
-        if let Some(ref mut stdin) = child.stdin {
-            stdin.write_all(text.as_bytes()).ok();
-        }
-        child.wait().ok();
     }
 
     pub fn pop_char(&mut self) {
