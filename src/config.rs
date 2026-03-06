@@ -55,7 +55,7 @@ fn parse_config(contents: &str) -> Result<Config, Box<dyn std::error::Error>> {
     Ok(Config { snippets })
 }
 
-fn config_path() -> PathBuf {
+pub fn config_path() -> PathBuf {
     let home = std::env::var("HOME").expect("HOME not set");
     PathBuf::from(home)
         .join(".config")
