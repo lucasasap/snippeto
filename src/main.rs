@@ -3,8 +3,8 @@ mod expander;
 mod keymap;
 mod snippet;
 
-use evdev::{Device, EventSummary, KeyCode};
-use keymap::{ShiftState, keycode_to_char};
+use evdev::{Device, EventSummary, KeyCode, LedCode};
+use keymap::XkbState;
 use std::process::Command;
 use std::sync::mpsc;
 use std::thread;
@@ -12,6 +12,7 @@ use std::thread;
 struct KeyEvent {
     code: KeyCode,
     value: i32,
+    char_value: String,
 }
 
 fn find_keyboards() -> Vec<(std::path::PathBuf, Device)> {
@@ -42,6 +43,36 @@ fn check_dependencies() {
         {
             eprintln!("snippeto: {cmd} not found, install wl-clipboard");
             std::process::exit(1);
+        }
+    }
+}
+
+fn sync_initial_modifiers(device: &Device, xkb: &XkbState) {
+    // Sync toggled modifiers via LED state
+    if let Ok(leds) = device.get_led_state() {
+        if leds.contains(LedCode::LED_CAPSL) {
+            xkb.sync_key_toggle(KeyCode::KEY_CAPSLOCK.code());
+        }
+        if leds.contains(LedCode::LED_NUML) {
+            xkb.sync_key_toggle(KeyCode::KEY_NUMLOCK.code());
+        }
+    }
+
+    // Sync held modifiers via key state
+    if let Ok(keys) = device.get_key_state() {
+        for key in [
+            KeyCode::KEY_LEFTSHIFT,
+            KeyCode::KEY_RIGHTSHIFT,
+            KeyCode::KEY_LEFTCTRL,
+            KeyCode::KEY_RIGHTCTRL,
+            KeyCode::KEY_LEFTALT,
+            KeyCode::KEY_RIGHTALT,
+            KeyCode::KEY_LEFTMETA,
+            KeyCode::KEY_RIGHTMETA,
+        ] {
+            if keys.contains(key) {
+                xkb.sync_key_down(key.code());
+            }
         }
     }
 }
@@ -90,13 +121,28 @@ fn main() {
         let name = device.name().unwrap_or("unknown").to_string();
         eprintln!("snippeto: monitoring {name} at {}", path.display());
 
+        let xkb = match XkbState::new() {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("snippeto: failed to create xkb state: {e}");
+                std::process::exit(1);
+            }
+        };
+
+        sync_initial_modifiers(&device, &xkb);
+
         thread::spawn(move || {
             loop {
                 match device.fetch_events() {
                     Ok(events) => {
                         for event in events {
                             if let EventSummary::Key(_, code, value) = event.destructure() {
-                                let _ = tx.send(KeyEvent { code, value });
+                                let char_value = xkb.process_key(code.code(), value);
+                                let _ = tx.send(KeyEvent {
+                                    code,
+                                    value,
+                                    char_value,
+                                });
                             }
                         }
                     }
@@ -111,16 +157,9 @@ fn main() {
 
     drop(tx);
 
-    let mut shift = ShiftState::new();
-
     eprintln!("snippeto: running");
 
     for event in rx {
-        // Update shift state (must happen before value filter for release events)
-        if shift.update(event.code, event.value) {
-            continue;
-        }
-
         // Only process key press, ignore release and repeat
         if event.value != 1 {
             continue;
@@ -146,9 +185,10 @@ fn main() {
             _ => {}
         }
 
-        if let Some((lower, upper)) = keycode_to_char(event.code) {
-            let ch = if shift.active() { upper } else { lower };
-            expander.push_char(ch);
+        for ch in event.char_value.chars() {
+            if !ch.is_control() {
+                expander.push_char(ch);
+            }
         }
     }
 
